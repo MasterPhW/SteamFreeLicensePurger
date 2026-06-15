@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -26,10 +26,97 @@ internal static class Program
     private static bool isRunning;
     private static bool isFirstLicenseList = true;
     private static Dictionary<uint, (EPaymentMethod PaymentMethod, ELicenseType LicenseType)> previousLicenses = [];
+    private static HashSet<uint> previouslyFailedAppIds = new();
     private static bool isExiting;
     private static string user;
     private static string pass;
     private static string accessToken;
+    private static int reconnectDelaySeconds = 5;
+
+    private static readonly System.Text.Json.JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    private sealed class CredentialsConfig
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public string RefreshToken { get; set; }
+    }
+
+    private static void LoadCredentials()
+    {
+        string path = "credentials.json";
+        if (File.Exists(path))
+        {
+            try
+            {
+                string json = File.ReadAllText(path);
+                var config = System.Text.Json.JsonSerializer.Deserialize<CredentialsConfig>(json, JsonOptions);
+                if (config != null)
+                {
+                    user = config.Username;
+                    pass = config.Password;
+                    accessToken = config.RefreshToken;
+                }
+            }
+            catch (IOException) { }
+            catch (System.Text.Json.JsonException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    private static void SaveCredentials(string username, string password, string token)
+    {
+        try
+        {
+            var config = new CredentialsConfig
+            {
+                Username = username,
+                Password = password,
+                RefreshToken = token
+            };
+            string json = System.Text.Json.JsonSerializer.Serialize(config, JsonOptions);
+            File.WriteAllText("credentials.json", json);
+        }
+        catch (IOException e)
+        {
+            Console.WriteLine($"Error saving credentials.json (IO): {e.Message}");
+        }
+        catch (UnauthorizedAccessException e)
+        {
+            Console.WriteLine($"Error saving credentials.json (Permissions): {e.Message}");
+        }
+    }
+
+    private static void LoadFailedApps()
+    {
+        string path = "blacklist.json";
+        if (File.Exists(path))
+        {
+            try
+            {
+                string json = File.ReadAllText(path);
+                var list = System.Text.Json.JsonSerializer.Deserialize<HashSet<uint>>(json, JsonOptions);
+                if (list != null)
+                {
+                    previouslyFailedAppIds = list;
+                }
+            }
+            catch (IOException) { }
+            catch (System.Text.Json.JsonException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    private static void SaveFailedApp()
+    {
+        try
+        {
+            string json = System.Text.Json.JsonSerializer.Serialize(previouslyFailedAppIds, JsonOptions);
+            File.WriteAllText("blacklist.json", json);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
 
     public static void Main()
     {
@@ -43,10 +130,17 @@ internal static class Program
         Console.WriteLine();
         Console.ResetColor();
 
-        ReadCredentialsAgain();
+        LoadCredentials();
+        LoadFailedApps();
+
+        if (string.IsNullOrEmpty(user) || string.IsNullOrEmpty(pass))
+        {
+            ReadCredentialsAgain();
+            SaveCredentials(user, pass, accessToken);
+        }
+
         InitializeSteamKit();
 
-        // Read any buffered keys so it doesn't auto exit
         while (Console.KeyAvailable)
         {
             Console.ReadKey(true);
@@ -85,7 +179,6 @@ internal static class Program
         manager.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
         manager.Subscribe<SteamUser.LoggedOnCallback>(OnLoggedOn);
         manager.Subscribe<SteamApps.LicenseListCallback>(OnLicenseList);
-
         isRunning = true;
 
         Console.WriteLine("Connecting to Steam...");
@@ -138,21 +231,31 @@ internal static class Program
     private static async void OnConnected(SteamClient.ConnectedCallback callback)
     {
         Console.WriteLine("Connected to Steam! Logging in...");
-
         try
         {
-            var authSession = await steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
+            if (string.IsNullOrEmpty(accessToken))
             {
+                var authSession = await steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
+                {
+                    Username = user,
+                    Password = pass,
+                    DeviceFriendlyName = nameof(SteamFreeLicenseRemover),
+                    Authenticator = new UserConsoleAuthenticator(),
+                }).ConfigureAwait(false);
+                var pollResponse = await authSession.PollingWaitForResultAsync().ConfigureAwait(false);
+
+                user = pollResponse.AccountName;
+                accessToken = pollResponse.RefreshToken;
+                SaveCredentials(user, pass, accessToken);
+            }
+
+            steamUser.LogOn(new SteamUser.LogOnDetails
+            {
+                LoginID = 3939934623,
                 Username = user,
-                Password = pass,
-                DeviceFriendlyName = nameof(SteamFreeLicenseRemover),
-                Authenticator = new UserConsoleAuthenticator(),
-            }).ConfigureAwait(false);
-
-            var pollResponse = await authSession.PollingWaitForResultAsync().ConfigureAwait(false);
-
-            user = pollResponse.AccountName;
-            accessToken = pollResponse.RefreshToken;
+                AccessToken = accessToken,
+                ShouldRememberPassword = false,
+            });
         }
         catch (AuthenticationException e)
         {
@@ -162,19 +265,18 @@ internal static class Program
                 : $"Authentication failed: {e.Result}");
             Console.ResetColor();
 
+            accessToken = null;
             ReadCredentialsAgain();
-            return;
+            SaveCredentials(user, pass, accessToken);
         }
-
-        pass = null;
-
-        steamUser.LogOn(new SteamUser.LogOnDetails
+#pragma warning disable CA1031
+        catch (Exception e)
+#pragma warning restore CA1031
         {
-            LoginID = 3939934623,
-            Username = user,
-            AccessToken = accessToken,
-            ShouldRememberPassword = false,
-        });
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"Steam connection interrupted during login: {e.Message}");
+            Console.ResetColor();
+        }
     }
 
     private static async void OnDisconnected(SteamClient.DisconnectedCallback callback)
@@ -182,15 +284,16 @@ internal static class Program
         if (isExiting)
         {
             isRunning = false;
-
             Console.WriteLine("Exiting...");
 
             return;
         }
 
-        Console.WriteLine("Disconnected from Steam, reconnecting in five seconds...");
+        Console.WriteLine($"Disconnected from Steam, reconnecting in {reconnectDelaySeconds} seconds...");
 
-        await Task.Delay(5000).ConfigureAwait(false);
+        await Task.Delay(TimeSpan.FromSeconds(reconnectDelaySeconds)).ConfigureAwait(false);
+        
+        reconnectDelaySeconds = 5;
 
         steamClient.Connect();
     }
@@ -208,11 +311,13 @@ internal static class Program
             else if (callback.Result is EResult.InvalidPassword or EResult.InvalidSignature or EResult.AccessDenied or EResult.Expired or EResult.Revoked)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Login failed ({callback.Result}). Please try again.");
+                Console.WriteLine($"Login failed ({callback.Result}). Token might be expired or access denied. Clearing token and reconnecting...");
                 Console.ResetColor();
 
                 accessToken = null;
-                ReadCredentialsAgain();
+                SaveCredentials(user, pass, accessToken);
+                
+                steamClient.Disconnect();
             }
             else
             {
@@ -226,16 +331,12 @@ internal static class Program
             return;
         }
 
-        user = null;
-        accessToken = null;
-
         Console.WriteLine("Logged on, waiting for licenses...");
     }
 
     private static void OnLicenseList(SteamApps.LicenseListCallback licenseList)
     {
         var currentLicenses = new Dictionary<uint, (EPaymentMethod PaymentMethod, ELicenseType LicenseType)>();
-
         foreach (var license in licenseList.LicenseList)
         {
             currentLicenses.TryAdd(license.PackageID, (license.PaymentMethod, license.LicenseType));
@@ -271,24 +372,42 @@ internal static class Program
 
         isFirstLicenseList = false;
         previousLicenses = currentLicenses;
-
         Task.Run(async () =>
         {
+            bool finished = false;
+
             try
             {
                 await ProcessLicenses(licenseList).ConfigureAwait(false);
+                finished = true;
             }
-#pragma warning disable CA1031 // Do not catch general exception types
+            catch (TaskCanceledException)
+            {
+                await Console.Error.WriteLineAsync().ConfigureAwait(false);
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                await Console.Error.WriteLineAsync("Network timeout / Rate limit reached. Sleeping for 30 minutes before next attempt...").ConfigureAwait(false);
+                Console.ResetColor();
+                
+                reconnectDelaySeconds = 1800;
+                isFirstLicenseList = true; 
+            }
+#pragma warning disable CA1031
             catch (Exception e)
-#pragma warning restore CA1031 // Do not catch general exception types
+#pragma warning restore CA1031
             {
                 await Console.Error.WriteLineAsync().ConfigureAwait(false);
                 Console.ForegroundColor = ConsoleColor.Red;
                 await Console.Error.WriteLineAsync(e.ToString()).ConfigureAwait(false);
                 Console.ResetColor();
+                
+                finished = true;
             }
 
-            isExiting = true;
+            if (finished)
+            {
+                isExiting = true;
+            }
+            
             steamUser.LogOff();
         });
     }
@@ -306,7 +425,6 @@ internal static class Program
             }
 
             packages.Add(new SteamApps.PICSRequest(license.PackageID, license.AccessToken));
-
             if (license.PaymentMethod == EPaymentMethod.Complimentary && license.LicenseType == ELicenseType.SinglePurchase)
             {
                 complimentaryPackageIds.Add(license.PackageID);
@@ -316,6 +434,7 @@ internal static class Program
         Console.WriteLine($"Total licenses: {licenseList.LicenseList.Count}");
         Console.WriteLine($"Complimentary licenses: {complimentaryPackageIds.Count}");
         Console.WriteLine($"Non-complimentary licenses: {packages.Count - complimentaryPackageIds.Count}");
+        Console.WriteLine($"Known bad AppIDs (Blacklist): {previouslyFailedAppIds.Count}");
 
         if (complimentaryPackageIds.Count == 0)
         {
@@ -327,17 +446,31 @@ internal static class Program
         Console.WriteLine("Fetching package info...");
 
         var (complimentaryApps, protectedAppIds) = await RequestPackageInfo(packages, complimentaryPackageIds).ConfigureAwait(false);
-
         Console.WriteLine();
         Console.WriteLine($"Apps in complimentary packages: {complimentaryApps.Values.SelectMany(x => x).Distinct().Count()}");
         Console.WriteLine($"Protected apps (covered by paid licenses): {protectedAppIds.Count}");
 
         Console.WriteLine();
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.Write("Are you sure you want to remove complimentary licenses? Type 'yes' to confirm: ");
+        Console.Write("Are you sure you want to remove complimentary licenses? Type 'yes' to confirm (Auto-start 'yes' in 60 seconds): ");
         Console.ResetColor();
 
-        var confirmation = Console.ReadLine()?.Trim();
+        string confirmation = "yes";
+        var inputTask = Task.Run(() => Console.ReadLine());
+        var delayTask = Task.Delay(TimeSpan.FromSeconds(60));
+
+        var completedTask = await Task.WhenAny(inputTask, delayTask).ConfigureAwait(false);
+
+        if (completedTask == inputTask)
+        {
+            confirmation = (await inputTask.ConfigureAwait(false))?.Trim() ?? "yes";
+        }
+        else
+        {
+            Console.WriteLine();
+            Console.WriteLine("No input detected. Automatically proceeding with 'yes' after 60 seconds timeout.");
+        }
+
         if (!string.Equals(confirmation, "yes", StringComparison.OrdinalIgnoreCase))
         {
             Console.WriteLine("Operation cancelled.");
@@ -358,7 +491,6 @@ internal static class Program
         foreach (var chunk in subInfoRequests.Chunk(ItemsPerRequest))
         {
             var info = await steamApps.PICSGetProductInfo([], chunk);
-
             if (info.Results == null)
             {
                 continue;
@@ -369,13 +501,11 @@ internal static class Program
                 foreach (var package in result.Packages.Values)
                 {
                     var appIds = new HashSet<uint>();
-
                     foreach (var id in package.KeyValues["appids"].Children)
                     {
                         appIds.Add(id.AsUnsignedInteger());
                     }
 
-                    // Non-complimentary (paid) packages - protect their apps
                     if (!complimentaryPackageIds.Contains(package.ID))
                     {
                         foreach (var appId in appIds)
@@ -389,9 +519,7 @@ internal static class Program
                         continue;
                     }
 
-                    // Complimentary packages - check if they're removable FreeOnDemand packages
                     var status = (EPackageStatus)package.KeyValues["status"].AsInteger();
-
                     if (status != EPackageStatus.Available)
                     {
                         foreach (var appId in appIds)
@@ -406,7 +534,6 @@ internal static class Program
                     }
 
                     var licenseType = (ELicenseType)package.KeyValues["licensetype"].AsInteger();
-
                     if (licenseType != ELicenseType.SinglePurchase)
                     {
                         Console.WriteLine($"PackageID {package.ID} skipped: license type is {licenseType}");
@@ -414,7 +541,6 @@ internal static class Program
                     }
 
                     var billingType = (EBillingType)package.KeyValues["billingtype"].AsInteger();
-
                     if (billingType != EBillingType.FreeOnDemand)
                     {
                         foreach (var appId in appIds)
@@ -479,8 +605,17 @@ internal static class Program
                     continue;
                 }
 
-                var result = await RemoveLicenseForApp(appId).ConfigureAwait(false);
+                if (previouslyFailedAppIds.Contains(appId))
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                    Console.WriteLine($"{progress} APP SKIPPED: {appId} (Previously failed)");
+                    Console.ResetColor();
+                    await logWriter.WriteLineAsync($"SKIP: AppID {appId} (PackageID {packageId}) - previously failed").ConfigureAwait(false);
+                    skippedCount++;
+                    continue;
+                }
 
+                var result = await RemoveLicenseForApp(appId).ConfigureAwait(false);
                 if (result == EResult.OK)
                 {
                     Console.ForegroundColor = ConsoleColor.Green;
@@ -491,14 +626,24 @@ internal static class Program
                 }
                 else
                 {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"{progress} APP FAILED: {appId} - {result}");
-                    Console.ResetColor();
-                    await logWriter.WriteLineAsync($"FAILED: AppID {appId} (PackageID {packageId}) - {result}").ConfigureAwait(false);
-                    failedCount++;
-                }
+                    string errorReason = result == EResult.InvalidParam
+                        ? "InvalidParam (Game is tied to a package / cannot be removed individually)"
+                        : result.ToString();
 
-                //await Task.Delay(100).ConfigureAwait(false);
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"{progress} APP FAILED: {appId} - {errorReason}");
+                    Console.ResetColor();
+                    await logWriter.WriteLineAsync($"FAILED: AppID {appId} (PackageID {packageId}) - {errorReason}").ConfigureAwait(false);
+                    failedCount++;
+
+                    if (previouslyFailedAppIds.Add(appId))
+                    {
+                        SaveFailedApp();
+                        Console.ForegroundColor = ConsoleColor.DarkGray;
+                        Console.WriteLine($"   -> AppID {appId} added to blacklist.json");
+                        Console.ResetColor();
+                    }
+                }
             }
         }
 

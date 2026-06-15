@@ -9,7 +9,7 @@ using SteamKit2.Authentication;
 using SteamKit2.Internal;
 
 [assembly: CLSCompliant(false)]
-namespace SteamFreeLicenseRemover;
+namespace SteamFreeLicensePurger;
 
 internal static class Program
 {
